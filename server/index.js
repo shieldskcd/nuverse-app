@@ -98,7 +98,7 @@ io.on('connection', (socket) => {
 
             // Step 4: Fetch initial game state from DB using numerical_session_id
 
-            // NEW: Fetch ALL card definitions from the 'cards' table for the debug display
+            // Fetch ALL card definitions from the 'cards' table for the debug display
             const [allCardDefinitions] = await dbPool.query(`SELECT * FROM cards ORDER BY card_id ASC LIMIT 50`); // Limit for sanity
             console.log(`[Socket Debug] Fetched ${allCardDefinitions.length} general card definitions.`);
 
@@ -121,13 +121,13 @@ io.on('connection', (socket) => {
                 sessionName: sessionName, // Also send the friendly name
                 players: [{ userId, username: 'TestUser' }], // Dummy, will fetch from DB later
                 
-                // NEW: Pass ALL card definitions separately for the debug display
+                // Pass ALL card definitions separately for the debug display
                 allCardDefinitions: allCardDefinitions.map(card => ({
                     card_id: card.card_id,
                     card_name: card.card_name,
                     card_type: card.card_type,
                     description: card.description, // etc. basic info
-                    power_level: card.power_level // For basic display
+                    power_level: card.power_level
                 })),
                 
                 // Pass player_cards for the session, for actual game state components later
@@ -154,7 +154,7 @@ io.on('connection', (socket) => {
             socket.to(numerical_session_id).emit('server:playerJoined', { userId, username: 'TestUser' }); // Broadcast to others
             console.log(`[Socket Debug] Emitted initial game state for session ${numerical_session_id}.`);
 
-            // Check if player_session exists, if not, create it
+            // Step 5: Check/create player_session entry
             const [playerSessions] = await dbPool.query('SELECT * FROM player_sessions WHERE user_id = ? AND session_id = ?', [user_id, numerical_session_id]);
             if (playerSessions.length === 0) {
                 await dbPool.query('INSERT INTO player_sessions (user_id, session_id) VALUES (?, ?)', [user_id, numerical_session_id]);
@@ -216,11 +216,13 @@ io.on('connection', (socket) => {
             const fullNewCard = {
                 card_id: newCardId,
                 player_card_id: playerCardId,
-                ownerId: userId,
+                ownerId: userId, // Frontend userId string
                 location: 'CreatedCardStorage',
                 slot_id: null,
                 is_active: false,
-                ...cardData
+                ...cardData, // Include original card data
+                // Ensure correct ownerId from DB (numerical) is mapped back if needed
+                // For now, userId (string) is okay for ownerId in frontend
             };
             
             // Add entry to combat_log
@@ -239,6 +241,171 @@ io.on('connection', (socket) => {
             socket.emit('error', 'Failed to create card. See server logs for details.');
         }
     });
+
+    // NEW: Handle 'client:moveCard' event
+    socket.on('client:moveCard', async ({ sessionId, userId, playerCardId, oldLocation, destinationLocation, destinationSlotId, isActive }) => {
+        console.log(`[Socket Debug] client:moveCard received for session ${sessionId}, user ${userId}. Card ${playerCardId} from ${oldLocation} to ${destinationLocation}.`);
+
+        try {
+            // Step 1: Validate move and get user_id (optional, assume valid for MVP)
+            let [users] = await dbPool.query('SELECT user_id FROM users WHERE username = ?', [userId]);
+            let user_id = users[0]?.user_id;
+            if (!user_id) {
+                console.error(`[Socket Error] User ${userId} not found for move card operation.`);
+                socket.emit('error', 'User not authenticated for card move.');
+                return;
+            }
+
+            // Step 2: Update the player_cards table
+            const [updateResult] = await dbPool.query(
+                `UPDATE player_cards
+                 SET location = ?, slot_id = ?, is_active = ?
+                 WHERE player_card_id = ? AND user_id = ? AND session_id = ?`,
+                [destinationLocation, destinationSlotId, isActive, playerCardId, user_id, sessionId]
+            );
+
+            if (updateResult.affectedRows === 0) {
+                console.warn(`[Socket Warn] No rows updated for playerCardId ${playerCardId} in session ${sessionId}. Card might not belong to user/session or doesn't exist.`);
+                socket.emit('error', 'Failed to move card (card not found or permission denied).');
+                return;
+            }
+            console.log(`[Socket Debug] player_cards updated for playerCardId ${playerCardId}.`);
+
+            // Step 3: Fetch the updated card data to broadcast
+            const [updatedCardRows] = await dbPool.query(
+                `SELECT pc.*, c.*
+                 FROM player_cards pc
+                 JOIN cards c ON pc.card_id = c.card_id
+                 WHERE pc.player_card_id = ?`,
+                [playerCardId]
+            );
+
+            if (updatedCardRows.length === 0) {
+                console.error(`[Socket Error] Could not refetch updated card ${playerCardId} after move.`);
+                socket.emit('error', 'Failed to retrieve moved card data.');
+                return;
+            }
+
+            const updatedCardData = {
+                card_id: updatedCardRows[0].card_id,
+                player_card_id: updatedCardRows[0].player_card_id,
+                ownerId: userId, // Keep frontend's userId string
+                location: updatedCardRows[0].location,
+                slot_id: updatedCardRows[0].slot_id,
+                is_active: updatedCardRows[0].is_active,
+                card_name: updatedCardRows[0].card_name,
+                card_type: updatedCardRows[0].card_type,
+                description: updatedCardRows[0].description,
+                power_level: updatedCardRows[0].power_level,
+                // ... map all other card properties from 'c.*' as needed for broadcast
+                // (copying all from the joinGame handler's map for consistency)
+                card_hero_type: updatedCardRows[0].card_hero_type, card_hero_class: updatedCardRows[0].card_hero_class, card_hero_role: updatedCardRows[0].card_hero_role,
+                card_ability_class_melee: updatedCardRows[0].card_ability_class_melee, card_ability_class_longrange: updatedCardRows[0].card_ability_class_longrange, card_ability_class_areaofeffect: updatedCardRows[0].card_ability_class_areaofeffect, card_ability_class_duration: updatedCardRows[0].card_ability_class_duration,
+                card_ability_is_burst: updatedCardRows[0].card_ability_is_burst, card_ability_burst_link_action: updatedCardRows[0].card_ability_burst_link_action, card_ability_burst_effect: updatedCardRows[0].card_ability_burst_effect,
+                card_suit_might_modifier: updatedCardRows[0].card_suit_might_modifier, card_suit_agility_modifier: updatedCardRows[0].card_suit_agility_modifier, card_suit_guts_modifier: updatedCardRows[0].card_guts_modifier, card_suit_intellect_modifier: updatedCardRows[0].card_intellect_modifier, card_suit_rally_modifier: updatedCardRows[0].card_rally_modifier,
+                card_weapon_damage: updatedCardRows[0].card_weapon_damage, card_weapon_range: updatedCardRows[0].card_weapon_range, card_weapon_effect_slot1: updatedCardRows[0].card_weapon_effect_slot1, card_weapon_effect_slot2: updatedCardRows[0].card_weapon_effect_slot2, card_weapon_effect_slot3: updatedCardRows[0].card_weapon_effect_slot3,
+                oldLocation: oldLocation // Send old location for frontend to remove from previous slot
+            };
+
+            // Step 4: Add log entry for move
+            await dbPool.query(
+                'INSERT INTO combat_log (session_id, user_id, card_id, action_type, action_description) VALUES (?, ?, ?, ?, ?)',
+                [sessionId, user_id, updatedCardData.card_id, 'Card Moved', `${userId} moved card "${updatedCardData.card_name}" from ${oldLocation} to ${destinationLocation}`]
+            );
+            console.log(`[Socket Debug] Log entry for card move added.`);
+
+
+            // Step 5: Broadcast the updated card data to all clients in the session
+            io.to(sessionId).emit('server:cardMoved', updatedCardData);
+            console.log(`[Socket Debug] Broadcasted card move for ${updatedCardData.card_name}.`);
+
+        } catch (err) {
+            console.error(`[Socket Error] Error moving card ${playerCardId} in session ${sessionId}:`, err);
+            socket.emit('error', 'Failed to move card. See server logs for details.');
+        }
+    });
+
+    // Handle 'client:playCardAction' event (moves card to discard)
+    socket.on('client:playCardAction', async ({ sessionId, userId, playerCardId, oldLocation }) => {
+        console.log(`[Socket Debug] client:playCardAction received for session ${sessionId}, user ${userId}. Card ${playerCardId}.`);
+
+        try {
+            // Step 1: Validate and get user_id
+            let [users] = await dbPool.query('SELECT user_id FROM users WHERE username = ?', [userId]);
+            let user_id = users[0]?.user_id;
+            if (!user_id) {
+                console.error(`[Socket Error] User ${userId} not found for play card operation.`);
+                socket.emit('error', 'User not authenticated for playing card.');
+                return;
+            }
+
+            // Step 2: Update player_cards: set location to 'DiscardPile', is_active to false
+            const [updateResult] = await dbPool.query(
+                `UPDATE player_cards
+                 SET location = ?, slot_id = ?, is_active = ?
+                 WHERE player_card_id = ? AND user_id = ? AND session_id = ?`,
+                ['DiscardPile', null, false, playerCardId, user_id, sessionId]
+            );
+
+            if (updateResult.affectedRows === 0) {
+                console.warn(`[Socket Warn] No rows updated for playerCardId ${playerCardId} on play. Card might not belong to user/session or doesn't exist.`);
+                socket.emit('error', 'Failed to play card (card not found or permission denied).');
+                return;
+            }
+            console.log(`[Socket Debug] player_cards updated for played card ${playerCardId}.`);
+
+            // Step 3: Fetch the updated card data to broadcast
+            const [updatedCardRows] = await dbPool.query(
+                `SELECT pc.*, c.*
+                 FROM player_cards pc
+                 JOIN cards c ON pc.card_id = c.card_id
+                 WHERE pc.player_card_id = ?`,
+                [playerCardId]
+            );
+
+            if (updatedCardRows.length === 0) {
+                console.error(`[Socket Error] Could not refetch updated card ${playerCardId} after play action.`);
+                socket.emit('error', 'Failed to retrieve played card data.');
+                return;
+            }
+
+            const playedCardData = {
+                card_id: updatedCardRows[0].card_id,
+                player_card_id: updatedCardRows[0].player_card_id,
+                ownerId: userId, // Keep frontend's userId string
+                location: updatedCardRows[0].location, // Should be 'DiscardPile'
+                slot_id: updatedCardRows[0].slot_id, // Should be null
+                is_active: updatedCardRows[0].is_active, // Should be false
+                card_name: updatedCardRows[0].card_name,
+                card_type: updatedCardRows[0].card_type,
+                description: updatedCardRows[0].description,
+                power_level: updatedCardRows[0].power_level,
+                // ... map all other card properties for broadcast
+                card_hero_type: updatedCardRows[0].card_hero_type, card_hero_class: updatedCardRows[0].card_hero_class, card_hero_role: updatedCardRows[0].card_hero_role,
+                card_ability_class_melee: updatedCardRows[0].card_ability_class_melee, card_ability_class_longrange: updatedCardRows[0].card_ability_class_longrange, card_ability_class_areaofeffect: updatedCardRows[0].card_ability_class_areaofeffect, card_ability_class_duration: updatedCardRows[0].card_ability_class_duration,
+                card_ability_is_burst: updatedCardRows[0].card_ability_is_burst, card_ability_burst_link_action: updatedCardRows[0].card_ability_burst_link_action, card_ability_burst_effect: updatedCardRows[0].card_ability_burst_effect,
+                card_suit_might_modifier: updatedCardRows[0].card_suit_might_modifier, card_suit_agility_modifier: updatedCardRows[0].card_agility_modifier, card_suit_guts_modifier: updatedCardRows[0].card_guts_modifier, card_suit_intellect_modifier: updatedCardRows[0].card_intellect_modifier, card_suit_rally_modifier: updatedCardRows[0].card_rally_modifier,
+                card_weapon_damage: updatedCardRows[0].card_weapon_damage, card_weapon_range: updatedCardRows[0].card_weapon_range, card_weapon_effect_slot1: updatedCardRows[0].card_weapon_effect_slot1, card_weapon_effect_slot2: updatedCardRows[0].card_weapon_effect_slot2, card_weapon_effect_slot3: updatedCardRows[0].card_weapon_effect_slot3,
+                oldLocation: oldLocation // Send old location for frontend to remove from previous slot
+            };
+
+            // Step 4: Add log entry for played card
+            await dbPool.query(
+                'INSERT INTO combat_log (session_id, user_id, card_id, action_type, action_description) VALUES (?, ?, ?, ?, ?)',
+                [sessionId, user_id, playedCardData.card_id, 'Card Played', `${userId} played card "${playedCardData.card_name}" from ${oldLocation} to DiscardPile`]
+            );
+            console.log(`[Socket Debug] Log entry for played card added.`);
+
+            // Step 5: Broadcast the updated card data to all clients in the session
+            io.to(sessionId).emit('server:cardPlayed', playedCardData);
+            console.log(`[Socket Debug] Broadcasted played card for ${playedCardData.card_name}.`);
+
+        } catch (err) {
+            console.error(`[Socket Error] Error playing card ${playerCardId} in session ${sessionId}:`, err);
+            socket.emit('error', 'Failed to play card. See server logs for details.');
+        }
+    });
+
 
     socket.on('disconnect', () => {
         console.log(`User disconnected: ${socket.id}`);
